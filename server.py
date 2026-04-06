@@ -23,18 +23,6 @@ MAX_BALANCE_USE = 0.95    # never spend more than 95% of available USD
 
 # ── POSITION TRACKER ────────────────────────────────────────────────────────
 open_positions = {}
-# Example:
-# {
-#   "strategy_1": {
-#       "side": "BUY",
-#       "entry": 1.2345,
-#       "sl": 1.2200,
-#       "tp": 1.2635,
-#       "usd_size": 25.00,
-#       "base_size": 18.500000,
-#       "time": "..."
-#   }
-# }
 
 # ── STARTUP LOGS ────────────────────────────────────────────────────────────
 def startup_log():
@@ -82,16 +70,14 @@ def build_jwt(method, path):
         "nbf": int(time.time()),
         "exp": int(time.time()) + 120,
         "uri": f"{method} api.coinbase.com{path}",
+        "nonce": str(uuid.uuid4()),  # FIX: nonce in payload, not headers
     }
 
     token = jwt.encode(
         payload,
         COINBASE_PRIVATE_KEY,
         algorithm="ES256",
-        headers={
-            "kid": COINBASE_API_KEY,
-            "nonce": str(int(time.time() * 1000))
-        },
+        headers={"kid": COINBASE_API_KEY},  # FIX: only kid in headers
     )
     return token
 
@@ -172,10 +158,6 @@ def get_xrp_price():
 
 # ── ORDER HELPERS ───────────────────────────────────────────────────────────
 def extract_order_success(result):
-    """
-    Coinbase may not return a simple {'success': True}.
-    This checks for common successful response shapes.
-    """
     if not result["ok"]:
         return False
 
@@ -208,12 +190,6 @@ def extract_order_id(result):
     return None
 
 def place_market_order(side, size, size_type="quote"):
-    """
-    BUY:
-      size_type='quote' => size is USD amount
-    SELL:
-      size_type='base'  => size is XRP quantity
-    """
     side = side.upper()
 
     if side not in ("BUY", "SELL"):
@@ -254,10 +230,8 @@ def close_position(strategy_id):
         return {"ok": False, "status_code": 400, "data": {"error": "No open position"}}
 
     if pos["side"] == "BUY":
-        # To close a long XRP position, sell the XRP quantity you hold
         result = place_market_order("SELL", pos["base_size"], size_type="base")
     else:
-        # If you ever support shorting later, you'd handle it differently
         return {"ok": False, "status_code": 400, "data": {"error": "Short close not supported"}}
 
     if extract_order_success(result):
@@ -365,28 +339,40 @@ def webhook():
         if balance <= 0:
             return jsonify({"error": "USD balance is zero or unavailable"}), 500
 
-        # 7) Calculate stop distance
-        risk_usd = balance * RISK_PERCENT
+        # 7) Use SL/TP from payload if provided, otherwise calculate
+        sl_from_payload = safe_float(data.get("sl", 0), 0)
+        tp_from_payload = safe_float(data.get("tp", 0), 0)
 
-        if atr > 0:
-            sl_distance = atr * 1.5
+        if sl_from_payload > 0 and tp_from_payload > 0:
+            # FIX: use the SL/TP your Pine Script already calculated
+            sl_price = round(sl_from_payload, 6)
+            tp_price = round(tp_from_payload, 6)
+            sl_distance = abs(price - sl_price)
+            tp_distance = abs(price - tp_price)
+            print(f"[SL/TP] Using payload values | SL: {sl_price} | TP: {tp_price}")
         else:
-            sl_distance = price * 0.01
+            # Fallback: calculate from ATR
+            if atr > 0:
+                sl_distance = atr * 1.5
+            else:
+                sl_distance = price * 0.01
+
+            tp_distance = sl_distance * REWARD_RATIO
+
+            if action == "BUY":
+                sl_price = round(price - sl_distance, 6)
+                tp_price = round(price + tp_distance, 6)
+            else:
+                sl_price = round(price + sl_distance, 6)
+                tp_price = round(price - tp_distance, 6)
+
+            print(f"[SL/TP] Calculated from ATR/fallback | SL: {sl_price} | TP: {tp_price}")
 
         if sl_distance <= 0:
             return jsonify({"error": "Invalid stop-loss distance"}), 500
 
-        tp_distance = sl_distance * REWARD_RATIO
-
-        if action == "BUY":
-            sl_price = round(price - sl_distance, 6)
-            tp_price = round(price + tp_distance, 6)
-        else:
-            sl_price = round(price + sl_distance, 6)
-            tp_price = round(price - tp_distance, 6)
-
         # 8) Position sizing
-        # Risk formula estimates how much USD position size fits the stop distance
+        risk_usd = balance * RISK_PERCENT
         usd_size = round(risk_usd / (sl_distance / price), 2)
         usd_cap = round(balance * MAX_BALANCE_USE, 2)
         usd_size = min(usd_size, usd_cap)
@@ -407,7 +393,6 @@ def webhook():
         if action == "BUY":
             result = place_market_order("BUY", usd_size, size_type="quote")
         else:
-            # For spot Coinbase, SELL requires base asset quantity
             result = place_market_order("SELL", base_size, size_type="base")
 
         if extract_order_success(result):
@@ -445,7 +430,9 @@ def webhook():
         }), 500
 
     except Exception as e:
+        import traceback
         print(f"[FATAL WEBHOOK ERROR] {e}")
+        print(traceback.format_exc())  # FIX: print full traceback for easier debugging
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 if __name__ == "__main__":
