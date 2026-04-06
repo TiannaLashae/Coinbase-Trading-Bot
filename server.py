@@ -1,10 +1,14 @@
 import os
 import time
 import uuid
+import secrets
+import traceback
 import requests
 import jwt
+
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
+from cryptography.hazmat.primitives import serialization
 
 app = Flask(__name__)
 
@@ -64,20 +68,29 @@ def build_jwt(method, path):
     if not COINBASE_API_KEY or not COINBASE_PRIVATE_KEY:
         raise ValueError("Missing Coinbase API credentials")
 
+    uri = f"{method} api.coinbase.com{path}"
+
+    private_key = serialization.load_pem_private_key(
+        COINBASE_PRIVATE_KEY.encode("utf-8"),
+        password=None
+    )
+
     payload = {
         "sub": COINBASE_API_KEY,
         "iss": "cdp",
         "nbf": int(time.time()),
         "exp": int(time.time()) + 120,
-        "uri": f"{method} api.coinbase.com{path}",
-        "nonce": str(uuid.uuid4()),  # FIX: nonce in payload, not headers
+        "uri": uri,
     }
 
     token = jwt.encode(
         payload,
-        COINBASE_PRIVATE_KEY,
+        private_key,
         algorithm="ES256",
-        headers={"kid": COINBASE_API_KEY},  # FIX: only kid in headers
+        headers={
+            "kid": COINBASE_API_KEY,
+            "nonce": secrets.token_hex(),
+        },
     )
     return token
 
@@ -88,6 +101,7 @@ def coinbase_request(method, path, body=None):
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
         response = requests.request(
@@ -113,6 +127,7 @@ def coinbase_request(method, path, body=None):
 
     except Exception as e:
         print(f"[COINBASE ERROR] {e}")
+        print(traceback.format_exc())
         return {
             "ok": False,
             "status_code": 500,
@@ -319,7 +334,7 @@ def webhook():
             return jsonify({
                 "error": "Close failed",
                 "details": result["data"]
-            }), 500
+            }), result.get("status_code", 500)
 
         # 5) Skip if already in a position
         if strategy_id in open_positions:
@@ -344,14 +359,12 @@ def webhook():
         tp_from_payload = safe_float(data.get("tp", 0), 0)
 
         if sl_from_payload > 0 and tp_from_payload > 0:
-            # FIX: use the SL/TP your Pine Script already calculated
             sl_price = round(sl_from_payload, 6)
             tp_price = round(tp_from_payload, 6)
             sl_distance = abs(price - sl_price)
             tp_distance = abs(price - tp_price)
             print(f"[SL/TP] Using payload values | SL: {sl_price} | TP: {tp_price}")
         else:
-            # Fallback: calculate from ATR
             if atr > 0:
                 sl_distance = atr * 1.5
             else:
@@ -427,12 +440,11 @@ def webhook():
         return jsonify({
             "error": "Order failed",
             "details": result["data"]
-        }), 500
+        }), result.get("status_code", 500)
 
     except Exception as e:
-        import traceback
         print(f"[FATAL WEBHOOK ERROR] {e}")
-        print(traceback.format_exc())  # FIX: print full traceback for easier debugging
+        print(traceback.format_exc())
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 if __name__ == "__main__":
