@@ -1,6 +1,6 @@
 import os
-import time
 import uuid
+import time
 import secrets
 import traceback
 import requests
@@ -20,6 +20,7 @@ raw_key = os.environ.get("COINBASE_PRIVATE_KEY", "")
 COINBASE_PRIVATE_KEY = raw_key.replace("\\n", "\n").strip()
 
 # ── SETTINGS ────────────────────────────────────────────────────────────────
+API_HOST = "api.coinbase.com"
 PRODUCT_ID = "XRP-USD"
 RISK_PERCENT = 0.01       # 1% of USD balance risked
 REWARD_RATIO = 2.0        # 2:1 reward:risk
@@ -68,12 +69,12 @@ def build_jwt(method, path):
     if not COINBASE_API_KEY or not COINBASE_PRIVATE_KEY:
         raise ValueError("Missing Coinbase API credentials")
 
-    uri = f"{method} api.coinbase.com{path}"
-
     private_key = serialization.load_pem_private_key(
         COINBASE_PRIVATE_KEY.encode("utf-8"),
         password=None
     )
+
+    uri = f"{method.upper()} {API_HOST}{path}"
 
     payload = {
         "sub": COINBASE_API_KEY,
@@ -97,7 +98,7 @@ def build_jwt(method, path):
 def coinbase_request(method, path, body=None):
     try:
         token = build_jwt(method, path)
-        url = f"https://api.coinbase.com{path}"
+        url = f"https://{API_HOST}{path}"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -105,7 +106,7 @@ def coinbase_request(method, path, body=None):
         }
 
         response = requests.request(
-            method=method,
+            method=method.upper(),
             url=url,
             headers=headers,
             json=body,
@@ -117,7 +118,7 @@ def coinbase_request(method, path, body=None):
         except Exception:
             data = {"raw_text": response.text}
 
-        print(f"[COINBASE] {method} {path} | Status: {response.status_code} | Response: {data}")
+        print(f"[COINBASE] {method.upper()} {path} | Status: {response.status_code} | Response: {data}")
 
         return {
             "ok": response.ok,
@@ -297,12 +298,10 @@ def health():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        # 1) Verify secret
         if not verify_webhook(request):
             print("[AUTH] Unauthorized webhook attempt")
             return jsonify({"error": "Unauthorized"}), 403
 
-        # 2) Parse JSON
         try:
             data = request.get_json(force=True) or {}
         except Exception as e:
@@ -318,10 +317,8 @@ def webhook():
         if action not in ("BUY", "SELL", "CLOSE"):
             return jsonify({"error": "Invalid action"}), 400
 
-        # 3) Always check SL/TP first
         check_sl_tp()
 
-        # 4) Handle CLOSE
         if action == "CLOSE":
             result = close_position(strategy_id)
             if extract_order_success(result):
@@ -336,7 +333,6 @@ def webhook():
                 "details": result["data"]
             }), result.get("status_code", 500)
 
-        # 5) Skip if already in a position
         if strategy_id in open_positions:
             print(f"[SKIP] Already in position for {strategy_id}")
             return jsonify({
@@ -344,7 +340,6 @@ def webhook():
                 "reason": "position already open"
             }), 200
 
-        # 6) Get balance and price
         balance = get_usd_balance()
         price = get_xrp_price()
 
@@ -354,7 +349,6 @@ def webhook():
         if balance <= 0:
             return jsonify({"error": "USD balance is zero or unavailable"}), 500
 
-        # 7) Use SL/TP from payload if provided, otherwise calculate
         sl_from_payload = safe_float(data.get("sl", 0), 0)
         tp_from_payload = safe_float(data.get("tp", 0), 0)
 
@@ -362,7 +356,6 @@ def webhook():
             sl_price = round(sl_from_payload, 6)
             tp_price = round(tp_from_payload, 6)
             sl_distance = abs(price - sl_price)
-            tp_distance = abs(price - tp_price)
             print(f"[SL/TP] Using payload values | SL: {sl_price} | TP: {tp_price}")
         else:
             if atr > 0:
@@ -384,7 +377,6 @@ def webhook():
         if sl_distance <= 0:
             return jsonify({"error": "Invalid stop-loss distance"}), 500
 
-        # 8) Position sizing
         risk_usd = balance * RISK_PERCENT
         usd_size = round(risk_usd / (sl_distance / price), 2)
         usd_cap = round(balance * MAX_BALANCE_USE, 2)
@@ -402,7 +394,6 @@ def webhook():
             f"SL: {sl_price} | TP: {tp_price}"
         )
 
-        # 9) Place order
         if action == "BUY":
             result = place_market_order("BUY", usd_size, size_type="quote")
         else:
