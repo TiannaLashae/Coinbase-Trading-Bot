@@ -148,6 +148,18 @@ def get_usd_balance():
 
     return 0.0
 
+def get_xrp_balance():
+    result = coinbase_request("GET", "/api/v3/brokerage/accounts")
+    if not result["ok"]:
+        return 0.0
+
+    data = result["data"]
+    for acct in data.get("accounts", []):
+        if acct.get("currency") == "XRP":
+            return safe_float(acct.get("available_balance", {}).get("value"), 0.0)
+
+    return 0.0
+
 def get_xrp_price():
     result = coinbase_request("GET", f"/api/v3/brokerage/best_bid_ask?product_ids={PRODUCT_ID}")
     if not result["ok"]:
@@ -245,10 +257,16 @@ def close_position(strategy_id):
         print(f"[CLOSE] No open position for {strategy_id}")
         return {"ok": False, "status_code": 400, "data": {"error": "No open position"}}
 
-    if pos["side"] == "BUY":
-        result = place_market_order("SELL", pos["base_size"], size_type="base")
-    else:
-        return {"ok": False, "status_code": 400, "data": {"error": "Short close not supported"}}
+    if pos["side"] != "BUY":
+        return {"ok": False, "status_code": 400, "data": {"error": "Only long spot positions supported"}}
+
+    # Use live XRP balance to close, not just stored base size
+    xrp_balance = get_xrp_balance()
+    if xrp_balance <= 0:
+        print(f"[CLOSE ERROR] No XRP balance available to close for {strategy_id}")
+        return {"ok": False, "status_code": 400, "data": {"error": "No XRP balance available to close"}}
+
+    result = place_market_order("SELL", xrp_balance, size_type="base")
 
     if extract_order_success(result):
         print(f"[CLOSE] Closed {strategy_id}")
@@ -317,10 +335,20 @@ def webhook():
         if action not in ("BUY", "SELL", "CLOSE"):
             return jsonify({"error": "Invalid action"}), 400
 
+        # Check any existing position for SL/TP first
         check_sl_tp()
 
-        if action == "CLOSE":
+        # SELL / CLOSE should close an existing long spot position
+        if action in ("SELL", "CLOSE"):
+            if strategy_id not in open_positions:
+                print(f"[SELL/CLOSE] No open position found for {strategy_id}")
+                return jsonify({
+                    "status": "skipped",
+                    "reason": "no open position to close"
+                }), 200
+
             result = close_position(strategy_id)
+
             if extract_order_success(result):
                 return jsonify({
                     "status": "closed",
@@ -333,6 +361,7 @@ def webhook():
                 "details": result["data"]
             }), result.get("status_code", 500)
 
+        # If BUY comes in while already in a trade, skip it
         if strategy_id in open_positions:
             print(f"[SKIP] Already in position for {strategy_id}")
             return jsonify({
@@ -372,12 +401,8 @@ def webhook():
 
             tp_distance = sl_distance * REWARD_RATIO
 
-            if action == "BUY":
-                sl_price = round(price - sl_distance, 6)
-                tp_price = round(price + tp_distance, 6)
-            else:
-                sl_price = round(price + sl_distance, 6)
-                tp_price = round(price - tp_distance, 6)
+            sl_price = round(price - sl_distance, 6)
+            tp_price = round(price + tp_distance, 6)
 
             print(f"[SL/TP] Calculated from ATR/fallback | SL: {sl_price} | TP: {tp_price}")
 
@@ -401,16 +426,13 @@ def webhook():
             f"SL: {sl_price} | TP: {tp_price}"
         )
 
-        if action == "BUY":
-            result = place_market_order("BUY", usd_size, size_type="quote")
-        else:
-            result = place_market_order("SELL", base_size, size_type="base")
+        result = place_market_order("BUY", usd_size, size_type="quote")
 
         if extract_order_success(result):
             order_id = extract_order_id(result)
 
             open_positions[strategy_id] = {
-                "side": action,
+                "side": "BUY",
                 "entry": price,
                 "sl": sl_price,
                 "tp": tp_price,
@@ -426,7 +448,7 @@ def webhook():
                 "status": "order placed",
                 "strategy": strategy_id,
                 "order_id": order_id,
-                "action": action,
+                "action": "BUY",
                 "entry": price,
                 "sl": sl_price,
                 "tp": tp_price,
