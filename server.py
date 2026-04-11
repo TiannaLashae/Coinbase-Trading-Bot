@@ -22,9 +22,9 @@ COINBASE_PRIVATE_KEY = raw_key.replace("\\n", "\n").strip()
 # ── SETTINGS ────────────────────────────────────────────────────────────────
 API_HOST = "api.coinbase.com"
 PRODUCT_ID = "XRP-USD"
-RISK_PERCENT = 0.01       # 1% of USD balance risked
-REWARD_RATIO = 2.0        # 2:1 reward:risk
-MAX_BALANCE_USE = 0.95    # never spend more than 95% of available USD
+RISK_PERCENT = 0.01
+REWARD_RATIO = 2.0
+MAX_BALANCE_USE = 0.95
 
 # ── POSITION TRACKER ────────────────────────────────────────────────────────
 open_positions = {}
@@ -265,7 +265,7 @@ def check_sl_tp():
 
     price = get_xrp_price()
     if not price:
-        print("[SL/TP] Could not fetch current price")
+        print("[SL/TP] Could not fetch current price, skipping check")
         return
 
     for strategy_id, pos in list(open_positions.items()):
@@ -341,7 +341,14 @@ def webhook():
             }), 200
 
         balance = get_usd_balance()
-        price = get_xrp_price()
+
+        # ── USE PRICE FROM WEBHOOK PAYLOAD FIRST ──────────────────────────
+        price = safe_float(data.get("price", 0), 0)
+        if price > 0:
+            print(f"[PRICE] Using price from webhook payload: {price}")
+        else:
+            print(f"[PRICE] No price in payload, fetching from Coinbase...")
+            price = get_xrp_price()
 
         if not price:
             return jsonify({"error": "Could not fetch XRP price"}), 500
